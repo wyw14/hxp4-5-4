@@ -3,6 +3,7 @@ import { SeededRandom, generateSeed } from '../utils/random';
 import { OrigamiSVG } from '../components/OrigamiSVG';
 import { Model3DViewer } from '../components/Model3DViewer';
 import { FoldStateManager } from './FoldStateManager';
+import { WrongQuestionManager } from './WrongQuestionManager';
 
 export interface GameState {
   currentQuestion: Question | null;
@@ -24,12 +25,21 @@ export class OrigamiGame {
   private foldStateManager: FoldStateManager | null = null;
   private modelViewers: Model3DViewer[] = [];
   private shuffledOptions: string[] = [];
+  private wrongQuestionManager: WrongQuestionManager;
+  private isReviewMode: boolean = false;
+  private reviewQuestionIds: string[] = [];
+  private reviewCurrentIndex: number = 0;
 
   private modelsContainer: HTMLElement | null = null;
   private submitBtn: HTMLButtonElement | null = null;
   private resetBtn: HTMLButtonElement | null = null;
   private hintBtn: HTMLButtonElement | null = null;
   private nextBtn: HTMLButtonElement | null = null;
+  private wrongListBtn: HTMLButtonElement | null = null;
+  private wrongCountBadge: HTMLElement | null = null;
+  private modalOverlay: HTMLElement | null = null;
+  private wrongListContainer: HTMLElement | null = null;
+  private returnBtn: HTMLButtonElement | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -44,6 +54,7 @@ export class OrigamiGame {
     this.seed = generateSeed();
     this.rng = new SeededRandom(this.seed);
     this.questionPool = this.rng.shuffle([...questionBank]);
+    this.wrongQuestionManager = new WrongQuestionManager();
 
     this.initUI();
     this.startGame();
@@ -67,6 +78,10 @@ export class OrigamiGame {
               <span class="stat-label">步数</span>
               <span class="stat-value" id="steps-display">0/0</span>
             </span>
+            <button class="btn-wrong-list" id="wrong-list-btn" title="错题本">
+              📝 错题本
+              <span class="wrong-count-badge" id="wrong-count-badge" style="display: none;">0</span>
+            </button>
           </div>
         </div>
 
@@ -95,7 +110,24 @@ export class OrigamiGame {
 
         <div class="game-footer">
           <button class="btn btn-next" id="next-btn" style="display: none;">➡️ 下一题</button>
+          <button class="btn btn-return" id="return-btn" style="display: none;">↩️ 返回题库</button>
           <div class="result-message" id="result-message"></div>
+        </div>
+      </div>
+
+      <div class="modal-overlay" id="modal-overlay" style="display: none;">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h2>📝 错题本</h2>
+            <button class="modal-close-btn" id="modal-close-btn">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="wrong-list-toolbar">
+              <span class="wrong-list-summary" id="wrong-list-summary">共 0 道错题</span>
+              <button class="btn btn-clear" id="clear-wrong-btn">🗑️ 清空错题</button>
+            </div>
+            <div class="wrong-list-container" id="wrong-list-container"></div>
+          </div>
         </div>
       </div>
     `;
@@ -105,11 +137,32 @@ export class OrigamiGame {
     this.resetBtn = this.container.querySelector('#reset-btn');
     this.hintBtn = this.container.querySelector('#hint-btn');
     this.nextBtn = this.container.querySelector('#next-btn');
+    this.wrongListBtn = this.container.querySelector('#wrong-list-btn');
+    this.wrongCountBadge = this.container.querySelector('#wrong-count-badge');
+    this.modalOverlay = this.container.querySelector('#modal-overlay');
+    this.wrongListContainer = this.container.querySelector('#wrong-list-container');
+    this.returnBtn = this.container.querySelector('#return-btn');
 
     this.submitBtn?.addEventListener('click', () => this.checkAnswer());
     this.resetBtn?.addEventListener('click', () => this.resetFolds());
     this.hintBtn?.addEventListener('click', () => this.showHint());
     this.nextBtn?.addEventListener('click', () => this.nextQuestion());
+    this.wrongListBtn?.addEventListener('click', () => this.openWrongList());
+    this.returnBtn?.addEventListener('click', () => this.exitReviewMode());
+
+    const closeModalBtn = this.container.querySelector('#modal-close-btn');
+    closeModalBtn?.addEventListener('click', () => this.closeWrongList());
+
+    const clearWrongBtn = this.container.querySelector('#clear-wrong-btn');
+    clearWrongBtn?.addEventListener('click', () => this.clearAllWrongQuestions());
+
+    this.modalOverlay?.addEventListener('click', (e) => {
+      if (e.target === this.modalOverlay) {
+        this.closeWrongList();
+      }
+    });
+
+    this.updateWrongCountBadge();
   }
 
   private startGame(): void {
@@ -117,14 +170,32 @@ export class OrigamiGame {
   }
 
   private loadQuestion(index: number): void {
-    let safeIndex = index;
-    if (index >= this.questionPool.length) {
-      this.currentQuestionIndex = 0;
-      this.questionPool = this.rng.shuffle([...questionBank]);
-      safeIndex = 0;
+    let question: Question;
+
+    if (this.isReviewMode) {
+      if (this.reviewCurrentIndex >= this.reviewQuestionIds.length) {
+        this.showMessage('🎉 恭喜！错题已全部复习完成', 'success');
+        if (this.nextBtn) this.nextBtn.style.display = 'none';
+        return;
+      }
+      const questionId = this.reviewQuestionIds[this.reviewCurrentIndex];
+      const found = this.wrongQuestionManager.getQuestionById(questionId);
+      if (!found) {
+        this.reviewCurrentIndex++;
+        this.loadQuestion(index);
+        return;
+      }
+      question = found;
+    } else {
+      let safeIndex = index;
+      if (index >= this.questionPool.length) {
+        this.currentQuestionIndex = 0;
+        this.questionPool = this.rng.shuffle([...questionBank]);
+        safeIndex = 0;
+      }
+      question = this.questionPool[safeIndex];
     }
 
-    const question = this.questionPool[safeIndex];
     this.state.currentQuestion = question;
     this.state.stepsUsed = 0;
     this.state.selectedModelId = null;
@@ -276,10 +347,21 @@ export class OrigamiGame {
       this.state.score += baseScore + stepsBonus;
       this.state.gameStatus = 'won';
       this.showMessage(`🎉 答对了！获得 ${baseScore + stepsBonus} 分`, 'success');
+
+      if (this.isReviewMode) {
+        this.wrongQuestionManager.removeRecord(this.state.currentQuestion.id);
+        this.updateWrongCountBadge();
+      }
     } else {
       this.state.gameStatus = 'lost';
       this.showMessage('😅 答错了，再试试吧！正确答案已高亮', 'error');
       this.highlightCorrectAnswer();
+
+      this.wrongQuestionManager.addWrongAnswer(
+        this.state.currentQuestion.id,
+        this.state.selectedModelId
+      );
+      this.updateWrongCountBadge();
     }
 
     this.updateScoreDisplay();
@@ -346,9 +428,14 @@ export class OrigamiGame {
   }
 
   private nextQuestion(): void {
-    this.currentQuestionIndex++;
-    this.state.level++;
-    this.loadQuestion(this.currentQuestionIndex);
+    if (this.isReviewMode) {
+      this.reviewCurrentIndex++;
+      this.loadQuestion(this.reviewCurrentIndex);
+    } else {
+      this.currentQuestionIndex++;
+      this.state.level++;
+      this.loadQuestion(this.currentQuestionIndex);
+    }
 
     if (this.nextBtn) {
       this.nextBtn.style.display = 'none';
@@ -381,7 +468,11 @@ export class OrigamiGame {
   private updateLevelDisplay(): void {
     const levelDisplay = this.container.querySelector('#level-display');
     if (levelDisplay) {
-      levelDisplay.textContent = String(this.state.level);
+      if (this.isReviewMode) {
+        levelDisplay.textContent = `错题${this.reviewCurrentIndex + 1}`;
+      } else {
+        levelDisplay.textContent = String(this.state.level);
+      }
     }
   }
 
@@ -425,6 +516,151 @@ export class OrigamiGame {
     if (resultEl) {
       resultEl.style.display = 'none';
     }
+  }
+
+  private updateWrongCountBadge(): void {
+    if (!this.wrongCountBadge) return;
+    const count = this.wrongQuestionManager.getWrongCount();
+    if (count > 0) {
+      this.wrongCountBadge.textContent = String(count);
+      this.wrongCountBadge.style.display = 'inline-flex';
+    } else {
+      this.wrongCountBadge.style.display = 'none';
+    }
+  }
+
+  private openWrongList(): void {
+    this.renderWrongList();
+    if (this.modalOverlay) {
+      this.modalOverlay.style.display = 'flex';
+    }
+  }
+
+  private closeWrongList(): void {
+    if (this.modalOverlay) {
+      this.modalOverlay.style.display = 'none';
+    }
+  }
+
+  private renderWrongList(): void {
+    if (!this.wrongListContainer) return;
+
+    const records = this.wrongQuestionManager.getRecords();
+    const summaryEl = this.container.querySelector('#wrong-list-summary');
+    if (summaryEl) {
+      summaryEl.textContent = `共 ${records.length} 道错题`;
+    }
+
+    if (records.length === 0) {
+      this.wrongListContainer.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">🎉</div>
+          <div class="empty-title">太棒了！</div>
+          <div class="empty-desc">暂无错题，继续保持！</div>
+        </div>
+      `;
+      return;
+    }
+
+    this.wrongListContainer.innerHTML = '';
+
+    records.forEach((record) => {
+      const question = this.wrongQuestionManager.getQuestionById(record.questionId);
+      if (!question) return;
+
+      const card = document.createElement('div');
+      card.className = 'wrong-item';
+
+      const difficultyStars = '⭐'.repeat(question.difficulty);
+      const lastWrongModelName = this.wrongQuestionManager.getModelName(record.lastWrongModelId);
+      const correctModelName = this.wrongQuestionManager.getModelName(question.correctModelId);
+
+      card.innerHTML = `
+        <div class="wrong-item-header">
+          <div class="wrong-item-title">
+            <span class="wrong-item-name">${question.name}</span>
+            <span class="wrong-item-difficulty">${difficultyStars}</span>
+          </div>
+          <div class="wrong-item-count">
+            <span class="count-badge">❌ 答错 ${record.wrongCount} 次</span>
+          </div>
+        </div>
+        <div class="wrong-item-desc">${question.description}</div>
+        <div class="wrong-item-details">
+          <div class="detail-row">
+            <span class="detail-label">上次错选：</span>
+            <span class="detail-value wrong">${lastWrongModelName}</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">正确答案：</span>
+            <span class="detail-value correct">${correctModelName}</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">最近答错：</span>
+            <span class="detail-value">${this.wrongQuestionManager.formatTime(record.lastWrongTime)}</span>
+          </div>
+        </div>
+        <div class="wrong-item-actions">
+          <button class="btn btn-review" data-question-id="${record.questionId}">🔄 重新挑战</button>
+          <button class="btn btn-remove" data-question-id="${record.questionId}">🗑️ 移除</button>
+        </div>
+      `;
+
+      this.wrongListContainer?.appendChild(card);
+    });
+
+    this.wrongListContainer.querySelectorAll('.btn-review').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const questionId = (e.target as HTMLElement).dataset.questionId;
+        if (questionId) {
+          this.startReviewMode([questionId]);
+        }
+      });
+    });
+
+    this.wrongListContainer.querySelectorAll('.btn-remove').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const questionId = (e.target as HTMLElement).dataset.questionId;
+        if (questionId) {
+          this.wrongQuestionManager.removeRecord(questionId);
+          this.updateWrongCountBadge();
+          this.renderWrongList();
+        }
+      });
+    });
+  }
+
+  private clearAllWrongQuestions(): void {
+    if (confirm('确定要清空所有错题吗？')) {
+      this.wrongQuestionManager.clearAll();
+      this.updateWrongCountBadge();
+      this.renderWrongList();
+    }
+  }
+
+  private startReviewMode(questionIds: string[]): void {
+    this.isReviewMode = true;
+    this.reviewQuestionIds = [...questionIds];
+    this.reviewCurrentIndex = 0;
+    this.closeWrongList();
+
+    if (this.returnBtn) {
+      this.returnBtn.style.display = 'inline-block';
+    }
+
+    this.loadQuestion(0);
+  }
+
+  private exitReviewMode(): void {
+    this.isReviewMode = false;
+    this.reviewQuestionIds = [];
+    this.reviewCurrentIndex = 0;
+
+    if (this.returnBtn) {
+      this.returnBtn.style.display = 'none';
+    }
+
+    this.loadQuestion(this.currentQuestionIndex);
   }
 
   getState(): GameState {
